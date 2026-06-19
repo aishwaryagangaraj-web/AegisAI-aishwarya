@@ -1,11 +1,12 @@
-from pydantic_settings import BaseSettings
 from typing import List
 from pydantic import field_validator
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
     DOCUMENT_SHARE_EXPIRE_DAYS: int = 7
     DOCUMENT_SHARE_SECRET_KEY: str = ""
+
     # App
     APP_NAME: str = "AegisAI"
     DEBUG: bool = False
@@ -18,11 +19,13 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # Stripe (optional — leave blank to disable billing)
     STRIPE_SECRET_KEY: str = ""
     STRIPE_PUBLISHABLE_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+
     # OAuth
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
@@ -34,7 +37,10 @@ class Settings(BaseSettings):
     STRIPE_PRICE_SCALE: str = ""
 
     # CORS
-    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ]
 
     # LLM provider
     LLM_API_KEY: str = "ollama"

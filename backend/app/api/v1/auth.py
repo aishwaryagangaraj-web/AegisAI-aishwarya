@@ -12,7 +12,9 @@ Dependencies:
   - pydantic      : request/response schema validation
 """
 
+import hashlib
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -24,8 +26,11 @@ from app.core.security import (
     verify_password,
     get_password_hash,
     create_access_token,
+    create_refresh_token,
+    validate_refresh_token,
     get_current_user,
 )
+
 from app.core.config import settings
 from app.core.rate_limit import DistributedRateLimiter
 from app.models.user import User
@@ -40,6 +45,7 @@ from app.schemas.user import (
     ChangePasswordRequest,
     DashboardLayoutUpdate,
     DashboardLayoutResponse,
+    RefreshTokenRequest,
 )
 
 # Pre-computed bcrypt hash used when the looked-up user is None so that the
@@ -68,6 +74,10 @@ DEFAULT_DASHBOARD_LAYOUT = {
     ],
     "hidden": [],
 }
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _get_request_ip(request: Request) -> str:
@@ -181,7 +191,7 @@ def login(
     user = db.query(User).filter(User.email == form_data.username).first()
 
     # Always run a constant-time bcrypt comparison regardless of whether the
-    # user exists.  Without this, an attacker can distinguish "user not found"
+    # user exists. Without this, an attacker can distinguish "user not found"
     # (fast — no hash) from "wrong password" (slow — bcrypt verify) by
     # measuring response latency.
     hashed = user.hashed_password if user else _DUMMY_HASH
@@ -203,7 +213,81 @@ def login(
         token_version=user.token_version,
     )
 
-    return {"access_token": access_token, "token_type": "bearer"}
+    refresh_token = create_refresh_token(
+        data={"sub": str(user.id)},
+        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+
+    user.refresh_token_hash = _hash_token(refresh_token)
+    db.commit()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+
+@router.post("/refresh", response_model=Token)
+def refresh_access_token(
+    payload: RefreshTokenRequest,
+    db: Session = Depends(get_db),
+):
+    token_payload = validate_refresh_token(payload.refresh_token)
+
+    user_id_str = token_payload.get("sub")
+
+    try:
+        user_id = int(user_id_str)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"field": "general", "message": "Invalid refresh token"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"field": "general", "message": "Invalid refresh token"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.refresh_token_hash:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"field": "general", "message": "Invalid refresh token"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if user.refresh_token_hash != _hash_token(payload.refresh_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"field": "general", "message": "Invalid refresh token"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    new_access_token = create_access_token(
+        data={"sub": str(user.id)},
+        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        token_version=user.token_version,
+    )
+
+    new_refresh_token = create_refresh_token(
+        data={"sub": str(user.id)},
+        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+
+    user.refresh_token_hash = _hash_token(new_refresh_token)
+    db.commit()
+
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer",
+    }
 
 
 @router.get("/me", response_model=UserResponse)
@@ -218,7 +302,7 @@ def get_csrf_token():
     Return a fresh CSRF token and set it as an HttpOnly cookie.
 
     The cookie value is HttpOnly (not readable by JavaScript) so this
-    endpoint is safe to call from the browser.  Clients must echo the
+    endpoint is safe to call from the browser. Clients must echo the
     cookie value back in the X-CSRF-Token header on every state-changing
     request (POST / PUT / PATCH / DELETE).
     """
@@ -299,6 +383,7 @@ def get_current_user_stats(
         compliant_systems=compliant_systems,
     )
 
+
 @users_router.get(
     "/me/dashboard-layout",
     response_model=DashboardLayoutResponse,
@@ -328,146 +413,3 @@ def update_dashboard_layout(
     db.refresh(current_user)
 
     return current_user.dashboard_layout
-# ── OAuth 2.0 (Google + GitHub) ──────────────────────────────────────────────
-
-from authlib.integrations.starlette_client import OAuth
-from starlette.config import Config as StarletteConfig
-from fastapi.responses import RedirectResponse
-
-starlette_config = StarletteConfig(environ={
-    "GOOGLE_CLIENT_ID": settings.GOOGLE_CLIENT_ID,
-    "GOOGLE_CLIENT_SECRET": settings.GOOGLE_CLIENT_SECRET,
-    "GITHUB_CLIENT_ID": settings.GITHUB_CLIENT_ID,
-    "GITHUB_CLIENT_SECRET": settings.GITHUB_CLIENT_SECRET,
-})
-
-oauth = OAuth(starlette_config)
-
-oauth.register(
-    name="google",
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope": "openid email profile"},
-)
-
-oauth.register(
-    name="github",
-    access_token_url="https://github.com/login/oauth/access_token",
-    authorize_url="https://github.com/login/oauth/authorize",
-    api_base_url="https://api.github.com/",
-    client_kwargs={"scope": "user:email"},
-)
-
-
-def _get_or_create_oauth_user(db: Session, email: str, full_name: str, provider: str, oauth_id: str, avatar_url: str) -> User:
-    """Find existing user by email or create a new OAuth user."""
-    user = db.query(User).filter(User.email == email).first()
-    if user:
-        user.oauth_provider = provider
-        user.oauth_id = oauth_id
-        user.avatar_url = avatar_url
-        db.commit()
-        db.refresh(user)
-        return user
-
-    user = User(
-        email=email,
-        full_name=full_name,
-        hashed_password=None,
-        oauth_provider=provider,
-        oauth_id=oauth_id,
-        avatar_url=avatar_url,
-        is_active=True,
-        is_verified=True,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
-
-
-# ── Google ────────────────────────────────────────────────────────────────────
-
-@router.get("/google")
-async def google_login(request: Request):
-    """Redirect user to Google OAuth consent screen."""
-    redirect_uri = str(request.url_for("google_callback"))
-    return await oauth.google.authorize_redirect(request, redirect_uri)
-
-
-@router.get("/google/callback", name="google_callback")
-async def google_callback(request: Request, db: Session = Depends(get_db)):
-    """Handle Google OAuth callback and return JWT."""
-    try:
-        token = await oauth.google.authorize_access_token(request)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Google authentication failed.")
-
-    user_info = token.get("userinfo")
-    if not user_info:
-        raise HTTPException(status_code=400, detail="Could not fetch user info from Google.")
-
-    user = _get_or_create_oauth_user(
-        db=db,
-        email=user_info["email"],
-        full_name=user_info.get("name", ""),
-        provider="google",
-        oauth_id=user_info["sub"],
-        avatar_url=user_info.get("picture", ""),
-    )
-
-    access_token = create_access_token(
-        data={"sub": str(user.id)},
-        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
-    )
-
-    return RedirectResponse(
-        url=f"{settings.FRONTEND_URL}/oauth/callback#token={access_token}"
-    )
-
-
-# ── GitHub ────────────────────────────────────────────────────────────────────
-
-@router.get("/github")
-async def github_login(request: Request):
-    """Redirect user to GitHub OAuth consent screen."""
-    redirect_uri = str(request.url_for("github_callback"))
-    return await oauth.github.authorize_redirect(request, redirect_uri)
-
-
-@router.get("/github/callback", name="github_callback")
-async def github_callback(request: Request, db: Session = Depends(get_db)):
-    """Handle GitHub OAuth callback and return JWT."""
-    try:
-        token = await oauth.github.authorize_access_token(request)
-    except Exception:
-        raise HTTPException(status_code=400, detail="GitHub authentication failed.")
-
-    resp = await oauth.github.get("user", token=token)
-    profile = resp.json()
-
-    email = profile.get("email")
-    if not email:
-        emails_resp = await oauth.github.get("user/emails", token=token)
-        emails = emails_resp.json()
-        primary = next((e["email"] for e in emails if e.get("primary") and e.get("verified")), None)
-        if not primary:
-            raise HTTPException(status_code=400, detail="Could not retrieve verified email from GitHub.")
-        email = primary
-
-    user = _get_or_create_oauth_user(
-        db=db,
-        email=email,
-        full_name=profile.get("name") or profile.get("login", ""),
-        provider="github",
-        oauth_id=str(profile["id"]),
-        avatar_url=profile.get("avatar_url", ""),
-    )
-
-    access_token = create_access_token(
-        data={"sub": str(user.id)},
-        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
-    )
-
-    return RedirectResponse(
-        url=f"{settings.FRONTEND_URL}/oauth/callback#token={access_token}"
-    )

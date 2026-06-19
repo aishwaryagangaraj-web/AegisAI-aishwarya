@@ -4,10 +4,7 @@ import { useAuthStore } from '../stores/authStore'
 const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim()
 const API_BASE_URL = configuredApiBaseUrl ? configuredApiBaseUrl.replace(/\/$/, '') : '/api/v1'
 
-// Queue for synchronizing concurrent 401 responses.  When a 401 arrives the
-// first request triggers logout + navigation; all other in-flight 401s
-// wait for that handler to finish before rejecting with their own error so
-// no rejection is silently dropped and no duplicate navigation occurs.
+// Queue for synchronizing concurrent 401 responses when refresh fails.
 let isHandling401 = false
 const pending401s: Array<{
   reject: (reason: unknown) => void
@@ -32,58 +29,101 @@ api.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   if (token) {
     config.headers.Authorization = `Bearer ${token}`
   }
-  // Generate a UUID for end-to-end request tracing.  Honours any
-  // server-supplied X-Request-ID from previous responses so correlated
-  // requests retain the same ID.
+  // Generate a UUID for end-to-end request tracing.
   const existingId = config.headers['X-Request-ID']
   config.headers['X-Request-ID'] = existingId || crypto.randomUUID()
   return config
 })
 
-const AUTH_ENDPOINTS = ['/auth/login', '/auth/register']
+// Handle 401 errors & token refresh
+const AUTH_ENDPOINTS = [
+  '/auth/login',
+  '/auth/register',
+  '/auth/refresh',
+]
 
-// Handle 401 errors
+let isRefreshing = false
+let refreshPromise: Promise<void> | null = null
+
 api.interceptors.response.use(
   (response: AxiosResponse) => response,
-  (error: unknown) => {
+  async (error: unknown) => {
     if (!axios.isAxiosError(error)) {
-  return Promise.reject(error)
-}
-    const url = error.config?.url || ''
-    const isAuthEndpoint = AUTH_ENDPOINTS.some((endpoint) => url.includes(endpoint))
-    const isUnAuthorized = error.response?.status === 401 && !isAuthEndpoint
-
-    if (isUnAuthorized) {
-      if (isHandling401) {
-        // Another 401 is already being processed.  Queue this rejection so it
-        // fires after the handler completes instead of being silently dropped.
-        return new Promise((_, reject) => {
-          pending401s.push({ reject, error })
-        })
-      }
-
-      isHandling401 = true
-      const currentError = error
-
-      // Logout and navigate to login without forcing a full page reload.
-      useAuthStore.getState().logout()
-      try {
-        window.history.pushState({}, '', '/login')
-        // Notify router listeners (e.g., react-router) to handle navigation.
-        window.dispatchEvent(new PopStateEvent('popstate'))
-      } catch (e) {
-        // Fallback: if SPA navigation fails, perform a safe replace.
-        window.location.replace('/login')
-      }
-
-      // Reject all queued promises with their original error so no caller is
-      // left hanging after the handler finishes.
-      const queue = pending401s.splice(0)
-      isHandling401 = false
-      queue.forEach(({ reject, error }) => reject(error))
-
-      return Promise.reject(currentError)
+      return Promise.reject(error)
     }
+
+    if (!error.config) {
+      return Promise.reject(error)
+    }
+
+    const originalRequest = error.config as InternalAxiosRequestConfig & {
+      _retry?: boolean
+    }
+
+    const url = originalRequest.url || ''
+    const isAuthEndpoint = AUTH_ENDPOINTS.some((endpoint) => url.includes(endpoint))
+
+    if (error.response?.status === 401 && !isAuthEndpoint && !originalRequest._retry) {
+      originalRequest._retry = true
+      const authStore = useAuthStore.getState()
+
+      try {
+        if (!authStore.refreshToken) {
+          throw new Error('Refresh token is unavailable')
+        }
+
+        if (!isRefreshing) {
+          isRefreshing = true
+          refreshPromise = axios
+            .post(`${API_BASE_URL}/auth/refresh`, {
+              refresh_token: authStore.refreshToken,
+            })
+            .then((response) => {
+              authStore.updateTokens(
+                response.data.access_token,
+                response.data.refresh_token
+              )
+            })
+            .finally(() => {
+              isRefreshing = false
+              refreshPromise = null
+            })
+        }
+
+        await refreshPromise
+
+        const newToken = useAuthStore.getState().token
+        if (newToken && originalRequest.headers) {
+          originalRequest.headers.Authorization = `Bearer ${newToken}`
+        }
+
+        return api(originalRequest)
+      } catch (refreshErr) {
+        isRefreshing = false
+        if (isHandling401) {
+          return new Promise((_, reject) => {
+            pending401s.push({ reject, error: refreshErr })
+          })
+        }
+
+        isHandling401 = true
+        authStore.logout()
+
+        try {
+          window.history.pushState({}, '', '/login')
+          window.dispatchEvent(new PopStateEvent('popstate'))
+        } catch {
+          window.location.replace('/login')
+        }
+
+        const queue = pending401s.splice(0)
+        isHandling401 = false
+        queue.forEach(({ reject, error }) => reject(error))
+
+        return Promise.reject(refreshErr)
+      }
+    }
+
     return Promise.reject(error)
   }
 )
@@ -195,13 +235,13 @@ export const authApi = {
     return data
   },
   updateMe: async (payload: {
-  full_name?: string
-  company_name?: string
-  onboarding_completed?: boolean
-}) => {
-  const { data } = await api.patch('/users/me', payload)
-  return data
-},
+    full_name?: string
+    company_name?: string
+    onboarding_completed?: boolean
+  }) => {
+    const { data } = await api.patch('/users/me', payload)
+    return data
+  },
 }
 
 // AI Systems API
@@ -326,10 +366,7 @@ export const notificationsApi = {
     api.delete(`/notifications/${id}`),
 }
 
-// ---------------------------------------------------------------------------
 // RAG Intelligence API
-// ---------------------------------------------------------------------------
-
 export interface RagCitation {
   source: string
   excerpt: string
@@ -358,17 +395,10 @@ export interface RagStreamCallbacks {
   onError?: (error: RagStreamError) => void
 }
 
-/**
- * Parse a buffer of SSE text into discrete (event, data) frames.
- * Returns the parsed events plus any trailing partial frame that should
- * be carried into the next chunk.
- */
 function parseSseBuffer(
   buffer: string,
 ): { events: Array<{ event: string; data: string }>; remainder: string } {
   const events: Array<{ event: string; data: string }> = []
-  // Frames are separated by a blank line (\n\n). Anything after the last
-  // \n\n is a partial frame to carry forward.
   const lastSep = buffer.lastIndexOf('\n\n')
   if (lastSep === -1) {
     return { events, remainder: buffer }
@@ -390,17 +420,6 @@ function parseSseBuffer(
 }
 
 export const ragApi = {
-  /**
-   * Stream a regulatory answer as Server-Sent Events.
-   *
-   * Uses `fetch` + ReadableStream rather than EventSource because EventSource
-   * is GET-only. The `signal` lets the caller abort the request (Stop button);
-   * the backend honours abort and stops generating tokens.
-   *
-   * Returns a promise that resolves when the stream ends naturally (after
-   * `done`) or rejects if the request fails before any events arrive. Stream
-   * events are surfaced through the callbacks, not the return value.
-   */
   query: async (question: string) => {
     const { data } = await api.post('/rag/query', {
       question,
@@ -452,7 +471,6 @@ export const ragApi = {
 
     try {
       for (;;) {
-        
         const { value, done } = await reader.read()
         if (done) break
         buffer += value
@@ -466,7 +484,7 @@ export const ragApi = {
             else if (event === 'done') callbacks.onDone?.(parsed)
             else if (event === 'error') callbacks.onError?.(parsed)
           } catch {
-            /* malformed JSON in a frame — skip rather than abort */
+            /* malformed JSON in a frame — skip */
           }
         }
       }
@@ -476,8 +494,7 @@ export const ragApi = {
   },
 }
 
-
-// Health API — uses root URL, not /api/v1
+// Health API
 export interface HealthResponse {
   status: "healthy" | "degraded";
   database: "connected" | "disconnected";
@@ -498,7 +515,6 @@ export interface GuardScanResponse {
   matched_patterns?: string[]
 }
 
-// Guard explainability (issue #77). Per-token attribution returned by SHAP/LIME.
 export interface GuardTokenAttribution {
   token: string
   attribution: number

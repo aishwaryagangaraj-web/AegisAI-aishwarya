@@ -46,10 +46,10 @@ export default function Login() {
     setLoading(true)
 
     try {
-      const tokenData = await authApi.login(email, password)
-      setAuth(tokenData.access_token, null)
-      const user = await authApi.getMe()
-      setAuth(tokenData.access_token, user)
+      const tokenData = await authApi.login(trimmedEmail, password)
+      setAuth(tokenData.access_token, tokenData.refresh_token, null)
+      const user = await authApi.getMe(tokenData.access_token)
+      setAuth(tokenData.access_token, tokenData.refresh_token, user)
       navigate('/')
     } catch (err) {
       if (axios.isAxiosError(err)) {
@@ -104,10 +104,10 @@ export default function Login() {
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className={`mt-1 block w-full px-3 py-2 border rounded-lg shadow-sm focus:ring-primary-500 focus:border-primary-500${
+              className={`mt-1 block w-full px-3 py-2 border rounded-lg shadow-sm focus:ring-primary-500 focus:border-primary-500 ${
                 errors.some((e: ValidationError) => e.field === 'email')
                   ? 'border-red-300 bg-red-50'
-                  : 'border-gray-300'
+                  : 'border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white'
               }`}
             />
             {errors.some((e: ValidationError) => e.field === 'email') && (
@@ -131,7 +131,7 @@ export default function Login() {
                 className={`block w-full pl-3 pr-10 py-2 border rounded-lg shadow-sm focus:ring-primary-500 focus:border-primary-500 ${
                   errors.some((e: ValidationError) => e.field === 'password')
                     ? 'border-red-300 bg-red-50'
-                    : 'border-gray-300'
+                    : 'border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white'
                 }`}
               />
               <button
@@ -147,14 +147,6 @@ export default function Login() {
                 {errors.find((e: ValidationError) => e.field === 'password')?.message}
               </p>
             )}
-            <input
-              id="password"
-              type="password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-lg shadow-sm focus:ring-primary-500 focus:border-primary-500"
-            />
           </div>
 
           <button
