@@ -42,8 +42,6 @@ def _patch_csrf_middleware(test_client):
     find_and_patch(test_client.app)
 
 
-
-
 @pytest.fixture(autouse=True)
 def bypass_csrf_for_tests(monkeypatch, request):
     """Keep endpoint tests focused on application behavior, not CSRF transport."""
@@ -209,6 +207,11 @@ class _CSRFClientWrapper:
     def _ensure_csrf(self) -> None:
         """Fetch a CSRF token if we do not have one yet."""
         if self._csrf_token is None:
+            cookie_token = self._inner.cookies.get("csrf_token")
+            if cookie_token:
+                self._csrf_token = cookie_token
+                return
+
             resp = self._inner.get("/api/v1/auth/csrf-token")
             assert resp.status_code == 200, f"CSRF token fetch failed: {resp.status_code}"
             self._csrf_token = resp.json()["token"]
@@ -217,16 +220,18 @@ class _CSRFClientWrapper:
     def _inject_csrf(self, kwargs: dict) -> None:
         """Add X-CSRF-Token header to state-changing request kwargs.
 
-        Only inject if not manually provided - tests may set their own token.
+        Preserves existing headers while injecting X-CSRF-Token if not already present.
         """
-        headers = dict(kwargs.get("headers", {}))
-        # Do NOT override a manually-provided X-CSRF-Token (tests may set their own)
-        if "X-CSRF-Token" not in headers:
+        headers = dict(kwargs.get("headers") or {})
+        if not any(key.lower() == "x-csrf-token" for key in headers):
             headers["X-CSRF-Token"] = self._csrf_token
         kwargs["headers"] = headers
 
     def get(self, url: str, **kwargs: object) -> Response:
-        return self._inner.get(url, **kwargs)
+        response = self._inner.get(url, **kwargs)
+        if url.startswith("/api/v1/auth/csrf-token") and response.status_code == 200:
+            self._csrf_token = response.json()["token"]
+        return response
 
     def post(self, url: str, **kwargs: object) -> Response:
         self._ensure_csrf()
@@ -249,10 +254,6 @@ class _CSRFClientWrapper:
         return self._inner.delete(url, **kwargs)
 
     def request(self, method: str, url: str, **kwargs: object) -> Response:
-        if method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
-            self._ensure_csrf()
-            self._inject_csrf(kwargs)
-        return self._inner.request(method, url, **kwargs)
         if method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
             self._ensure_csrf()
             self._inject_csrf(kwargs)
